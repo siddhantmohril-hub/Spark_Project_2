@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import avg,concat,col,hash,isnull,current_timestamp
+from pyspark.sql.functions import avg,concat,col,hash,isnull,current_timestamp,lit
 from datetime import datetime
 import cx_Oracle
 import os
@@ -26,7 +26,7 @@ def read_tgt_data(cur,hsh):
     #hsh=[-2100697113,-2100731790]
     try:
         p=",".join(":"+str(i+1) for i in range(len(hsh)))
-        qry=f"SELECT * FROM TAXI_TRIPDATA WHERE \"key_hash\" IN ({p})"
+        qry=f"SELECT * FROM TAXI_TRIPDATA_HIST WHERE \"key_hash\" IN ({p}) and \"cur_rec_ind\"=\"Y\""
         cur.execute(qry,hsh)
         col=[i[0] for i in cur.description]
         df1=spark.createDataFrame(cur.fetchall(),col)
@@ -34,6 +34,68 @@ def read_tgt_data(cur,hsh):
     except Exception as e:
         print(e)
         return None
+def temp_hash(df):
+    tmp_df=df.withColumn("temp_hash",hash(concat(col("passenger_count"),col("trip_distance"),col("RatecodeID"),col("store_and_fwd_flag"),\
+                                            col("payment_type"),col("fare_amount"),col("extra"),col("mta_tax"),\
+                                                col("tip_amount"),col("tolls_amount"),col("improvement_surcharge"),col("total_amount"),\
+                                                    col("congestion_surcharge"),col("Airport_fee"),col("cbd_congestion_fee"))))
+    return tmp_df
+def type_2_upd(tgt_df,temp_df):
+    tgt_df=temp_hash(tgt_df)
+    temp_df=temp_hash(temp_df)
+    final_df=temp_df.join(tgt_df,temp_df.temp_hash==tgt_df.temp_hash,"left")
+    final_df=final_df.select(temp_df.VendorID,temp_df.tpep_pickup_datetime,temp_df.tpep_dropoff_datetime,temp_df.passenger_count,temp_df.trip_distance,\
+                    temp_df.RatecodeID,temp_df.store_and_fwd_flag,temp_df.PULocationID,temp_df.DOLocationID,temp_df.payment_type,temp_df.fare_amount,temp_df.extra,\
+                        temp_df.mta_tax,temp_df.tip_amount,temp_df.tolls_amount,temp_df.improvement_surcharge,temp_df.total_amount,temp_df.congestion_surcharge,\
+                            temp_df.Airport_fee,temp_df.cbd_congestion_fee,temp_df.key_hash)\
+                                .filter(isnull(tgt_df.temp_hash))
+    return final_df  
+def dataload_tgt(cursor,final_df):
+    cursor.execute("SELECT ts.table_name FROM all_tables ts WHERE ts.tablespace_name = 'EXAMPLE' ORDER BY ts.table_name")
+    p=cursor.fetchall()
+    if p is None:
+        q='CREATE TABLE \
+            TAXI_TRIPDATA_HIST (\
+                VendorID NUMBER(10),\
+                tpep_pickup_datetime TIMESTAMP,\
+                tpep_dropoff_datetime TIMESTAMP,\
+                passenger_count NUMBER(10),\
+                trip_distance NUMBER(10,2),\
+                RatecodeID NUMBER(10,2),\
+                store_and_fwd_flag   CHAR(1),\
+                PULocationID         NUMBER(10),\
+                DOLocationID         NUMBER(10),\
+                payment_type         NUMBER(10),\
+                fare_amount          NUMBER(10,2),\
+                extra                NUMBER(10,2),\
+                mta_tax              NUMBER(10,2),\
+                tip_amount           NUMBER(10,2),\
+                tolls_amount         NUMBER(10,2),\
+                improvement_surcharge   NUMBER(10,2),\
+                total_amount         NUMBER(10,2),\
+                congestion_surcharge NUMBER(10,2),\
+                Airport_fee          NUMBER(10,2),\
+                cbd_congestion_fee   NUMBER(10,2),\
+                cur_rec_ind     CHAR(1),\
+                key_hash VARCHAR2(256),\
+                CREATE_TS TIMESTAMP)'
+        cursor.execute(q)
+        cursor.execute('COMMIT')
+    final_df=final_df.withColumn("cur_rec_ind",lit("Y"))
+    oracle_properties={
+        "driver":"oracle.jdbc.driver.OracleDriver",
+        "url": "jdbc:oracle:thin:@localhost:1521:oracldb",
+        "user": "system",
+        "password": "Oct_2k25"
+    }
+    final_df.write.format("jdbc") \
+    .option("url", oracle_properties["url"]) \
+    .option("driver", oracle_properties["driver"]) \
+    .option("dbtable", "TAXI_TRIPDATA_HIST") \
+    .option("user", oracle_properties["user"]) \
+    .option("password", oracle_properties["password"]) \
+    .mode("append").save()
+    return
 def dbconnect():
     #cx_Oracle.init_oracle_client(lib_dir=r"C:\instantclient_21_7")
     hostname='localhost'
