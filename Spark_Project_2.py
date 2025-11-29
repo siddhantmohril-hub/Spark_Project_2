@@ -22,17 +22,27 @@ def add_timestamp(s_df):
     t_df=s_df.withColumn("CREATE_TS",current_timestamp())
     return t_df
 # reading the Data already in output table
+def conv_to_flt(val):
+    #print(type(val))
+    if isinstance(val,type(None)):
+        return 0
+    return val
 def read_tgt_data(cur,hsh):
-    #hsh=[-2100697113,-2100731790]
+    hsh=[-1087655974,248726584]
     try:
         p=",".join(":"+str(i+1) for i in range(len(hsh)))
-        qry=f"SELECT * FROM TAXI_TRIPDATA_HIST WHERE \"key_hash\" IN ({p}) and \"cur_rec_ind\"=\"Y\""
+        qry=f"SELECT * FROM TAXI_TRIPDATA_HIST WHERE \"key_hash\" IN ({p}) and \"cur_rec_ind\"=\'Y\'"
         cur.execute(qry,hsh)
         col=[i[0] for i in cur.description]
-        df1=spark.createDataFrame(cur.fetchall(),col)
+        a=cur.fetchall()
+        #print(a)
+        rows_as_dict=[dict(zip(col,[conv_to_flt(x) for x in r])) for r in a]
+        #print(rows_as_dict)
+        df1=spark.createDataFrame(rows_as_dict)
         return df1
     except Exception as e:
         print(e)
+        print("in read_tgt_data")
         return None
 def temp_hash(df):
     tmp_df=df.withColumn("temp_hash",hash(concat(col("passenger_count"),col("trip_distance"),col("RatecodeID"),col("store_and_fwd_flag"),\
@@ -40,9 +50,10 @@ def temp_hash(df):
                                                 col("tip_amount"),col("tolls_amount"),col("improvement_surcharge"),col("total_amount"),\
                                                     col("congestion_surcharge"),col("Airport_fee"),col("cbd_congestion_fee"))))
     return tmp_df
-def type_2_upd(tgt_df,temp_df):
+def type_2_upd(cur,tgt_df,temp_df):
     tgt_df=temp_hash(tgt_df)
     temp_df=temp_hash(temp_df)
+    upd_data(cur,tgt_df,temp_df)
     final_df=temp_df.join(tgt_df,temp_df.temp_hash==tgt_df.temp_hash,"left")
     final_df=final_df.select(temp_df.VendorID,temp_df.tpep_pickup_datetime,temp_df.tpep_dropoff_datetime,temp_df.passenger_count,temp_df.trip_distance,\
                     temp_df.RatecodeID,temp_df.store_and_fwd_flag,temp_df.PULocationID,temp_df.DOLocationID,temp_df.payment_type,temp_df.fare_amount,temp_df.extra,\
@@ -77,11 +88,11 @@ def dataload_tgt(cursor,final_df):
                 Airport_fee          NUMBER(10,2),\
                 cbd_congestion_fee   NUMBER(10,2),\
                 cur_rec_ind     CHAR(1),\
-                key_hash VARCHAR2(256),\
+                key_hash NUMBER(10,2),\
                 CREATE_TS TIMESTAMP)'
         cursor.execute(q)
         cursor.execute('COMMIT')
-    final_df=final_df.withColumn("cur_rec_ind",lit("Y"))
+    final_df=final_df.withColumn("cur_rec_ind",lit('Y'))
     oracle_properties={
         "driver":"oracle.jdbc.driver.OracleDriver",
         "url": "jdbc:oracle:thin:@localhost:1521:oracldb",
@@ -96,6 +107,23 @@ def dataload_tgt(cursor,final_df):
     .option("password", oracle_properties["password"]) \
     .mode("append").save()
     return
+def upd_data(cur,tgt_df,temp_df):
+    try:
+        upd_df=tgt_df.join(temp_df,tgt_df.key_hash==temp_df.key_hash,"inner")
+        upd_df=upd_df.select(tgt_df.key_hash).filter(tgt_df.temp_hash!=temp_df.temp_hash)
+        upd_lst=[int(i["key_hash"]) for i in upd_df.collect()]
+        upd_lst.append(248726584)
+        p=",".join(":"+str(i+1) for i in range(len(upd_lst)))
+        if p is not None:
+            qry=f"UPDATE TAXI_TRIPDATA_HIST SET \"cur_rec_ind\"=\'N\' WHERE \"key_hash\" in ({p})"
+            print(qry)
+            cur.execute(qry,upd_lst)
+            cur.execute('COMMIT')
+        return
+    except Exception as e:
+        print(e)
+        print("in upd_data")
+        return
 def dbconnect():
     #cx_Oracle.init_oracle_client(lib_dir=r"C:\instantclient_21_7")
     hostname='localhost'
@@ -130,9 +158,10 @@ def main():
     x_lst=[int(i["key_hash"]) for i in x_lst.collect()]
     #print(type(cursor))
     tgt_df=read_tgt_data(cursor,x_lst)
+    #tgt_df.show(1)
     #print(tgt_df.count()) 
     if tgt_df is not None:
-        final_df=type_2_upd(tgt_df,temp_df)
+        final_df=type_2_upd(cursor,tgt_df,temp_df)
     else:
         final_df=temp_df
     final_df=add_timestamp(final_df)
